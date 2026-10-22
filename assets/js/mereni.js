@@ -1,0 +1,249 @@
+// Měření: GA4 (gtag.js) s Google Consent Mode v2. Výchozí stav je "denied" - gtag.js
+// se načte vždy (nutné pro consent mode), ale nic neukládá ani neposílá do GA4, dokud
+// návštěvník neklikne "Přijmout měření". Na localhostu se gtag.js vůbec nenačítá.
+(function () {
+  var GA4_ID = 'G-E4GBFEEDG0';
+  // Google Ads: doplnit ID účtu (AW-XXXXXXXXX) a štítky konverzí z Google Ads
+  // (Cíle > Konverze > Webová stránka > Nastavení značky). Prázdné = Ads tag se nenačítá.
+  var ADS_ID = '';
+  var ADS_LABELS = { phone_click: '', generate_lead: '' };
+  window.dataLayer = window.dataLayer || [];
+  function gtag() { window.dataLayer.push(arguments); }
+  window.gtag = gtag;
+
+  var KEY = 'janak-consent';
+  var local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+  var page = location.pathname;
+  var banner = document.querySelector('.cookie-banner');
+
+  gtag('consent', 'default', {
+    analytics_storage: 'denied',
+    ad_storage: 'denied',
+    ad_user_data: 'denied',
+    ad_personalization: 'denied',
+    wait_for_update: 500
+  });
+
+  if (!local) {
+    var s = document.createElement('script');
+    s.async = true;
+    s.src = 'https://www.googletagmanager.com/gtag/js?id=' + GA4_ID;
+    document.head.appendChild(s);
+    gtag('js', new Date());
+    gtag('config', GA4_ID);
+    if (ADS_ID) gtag('config', ADS_ID);
+  }
+
+  // Napojení formuláře na Telegram (outputs/lead-telegram-automation). [doplnit] až bude
+  // Worker nasazený - do té doby formulář jen ukáže potvrzení lokálně (prototyp).
+  var FALLBACK_PHONE = '+420 773 146 244';
+
+  // Formulář může mít vlastní cíl (jiný e-mail/kanál než hlavní poptávka) přes
+  // data-lead-endpoint-var="JMENO_PROMENNE" - jinak se použije společný JANAK_LEAD_ENDPOINT.
+  function leadEndpointFor(form) {
+    var varName = form.dataset.leadEndpointVar;
+    if (varName && window[varName]) return window[varName];
+    return window.JANAK_LEAD_ENDPOINT || '';
+  }
+
+  function readConsent() {
+    try { return localStorage.getItem(KEY); } catch (e) { return null; }
+  }
+
+  function saveConsent(value) {
+    try {
+      if (value) localStorage.setItem(KEY, value);
+      else localStorage.removeItem(KEY);
+    } catch (e) { /* bez úložiště se volba nezapamatuje, banner se zobrazí znovu */ }
+  }
+
+  // 'unset' = návštěvník zatím nerozhodl; štítky u tlačítek podle toho ukazují stav
+  function applyConsent(value) {
+    var state = value || 'unset';
+    var s = state === 'granted' ? 'granted' : 'denied';
+    document.body.dataset.consent = state;
+    if (state !== 'unset') {
+      gtag('consent', 'update', {
+        analytics_storage: s,
+        ad_storage: s,
+        ad_user_data: s,
+        ad_personalization: s
+      });
+    }
+    if (banner) banner.hidden = state !== 'unset';
+  }
+
+  function track(name, params) {
+    if (readConsent() !== 'granted') return;
+    var data = Object.assign({ page_path: page }, params);
+    gtag('event', name, data);
+    if (ADS_ID && ADS_LABELS[name] && !local) gtag('event', 'conversion', { send_to: ADS_ID + '/' + ADS_LABELS[name] });
+    if (local) console.info('[měření]', name, data);
+  }
+
+  document.addEventListener('click', function (e) {
+    if (e.target.closest('[data-cookie-reset]')) {
+      saveConsent(null);
+      applyConsent(null);
+      return;
+    }
+    var el = e.target.closest('a');
+    if (!el) return;
+    var href = el.getAttribute('href') || '';
+    if (href.indexOf('tel:') === 0) {
+      track('phone_click', { phone_location: el.dataset.telLoc || 'neznamo' });
+    } else if (href.indexOf('mailto:') === 0) {
+      track('email_click', { email_location: el.dataset.emailLoc || 'neznamo' });
+    } else if (el.dataset.cta) {
+      track('cta_click', { cta_name: el.dataset.cta });
+    }
+  });
+
+  if (banner) {
+    banner.addEventListener('click', function (e) {
+      var btn = e.target.closest('[data-consent-set]');
+      if (!btn) return;
+      var value = btn.dataset.consentSet;
+      saveConsent(value);
+      applyConsent(value);
+    });
+  }
+
+  // Zobrazí záložní zprávu, když se poptávku nepodařilo odeslat na Telegram (Worker nedostupný
+  // apod.) - klonuje styl existujícího [data-thanks] prvku, aby nebylo nutné upravovat HTML.
+  // Úspěch: ukázat poděkování, vyčistit formulář (včetně popisku nahrané fotky) a posunout poděkování do zorného pole
+  function finishOk(form, thanks, real) {
+    var note = thanks && thanks.querySelector('.ov');
+    if (note) note.hidden = real; // poznámka o prototypu zmizí, jakmile se odesílá doopravdy
+    form.reset();
+    var file = form.querySelector('input[type="file"]');
+    if (file) file.dispatchEvent(new Event('change', { bubbles: true }));
+    var ph = form.querySelector('input[name="phone"]');
+    if (ph) { ph.setCustomValidity(''); ph.removeAttribute('aria-invalid'); }
+    var fe = form.querySelector('.fld-err'); if (fe) fe.hidden = true;
+    if (thanks) {
+      thanks.hidden = false;
+      thanks.setAttribute('tabindex', '-1');
+      thanks.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+
+  function showSendError(form, thanks) {
+    var fail = form.querySelector('[data-send-error]');
+    if (!fail) {
+      fail = document.createElement('p');
+      fail.setAttribute('data-send-error', '');
+      fail.setAttribute('role', 'status');
+      if (thanks) fail.className = thanks.className;
+      fail.textContent = 'Nepodařilo se odeslat poptávku. Zavolejte nám prosím na ' + FALLBACK_PHONE + ', nebo zkuste formulář odeslat znovu.';
+      if (thanks && thanks.parentNode) thanks.parentNode.insertBefore(fail, thanks.nextSibling);
+      else form.appendChild(fail);
+    }
+    fail.hidden = false;
+  }
+
+  // Formulář: kde lidé začnou, kde odcházejí a kde se zaseknou. Hodnoty polí neposíláme, jen názvy polí.
+  document.querySelectorAll('[data-lead-form]').forEach(function (form) {
+    var type = form.dataset.formType || 'neznamo';
+    var started = false;
+    var submitted = false;
+    var seen = {};
+    var lastField = '';
+
+    // Telefon: aspoň 9 číslic (mezery, +420 a pomlčky se nepočítají), chyba přímo u pole
+    var phone = form.querySelector('input[name="phone"]');
+    var phoneErr = null;
+    function phoneDigits() { return (phone.value.match(/\d/g) || []).length; }
+    function checkPhone(showEmpty) {
+      var empty = !phone.value.trim();
+      var bad = !empty && phoneDigits() < 9;
+      phone.setCustomValidity(bad ? 'Zadejte telefon alespoň s 9 číslicemi.' : '');
+      if (!phoneErr) {
+        phoneErr = document.createElement('p');
+        phoneErr.className = 'fld-err'; phoneErr.setAttribute('role', 'alert'); phoneErr.hidden = true;
+        phoneErr.id = (phone.id || 'phone') + '-err';
+        (phone.closest('label') || phone.parentNode).insertAdjacentElement('afterend', phoneErr);
+        phone.setAttribute('aria-describedby', phoneErr.id);
+      }
+      phoneErr.textContent = bad ? 'Zadejte telefon alespoň s 9 číslicemi, např. 773 146 244.' : '';
+      phoneErr.hidden = !bad;
+      phone.setAttribute('aria-invalid', bad ? 'true' : 'false');
+      return !bad;
+    }
+    if (phone) {
+      phone.addEventListener('input', function () { if (phone.getAttribute('aria-invalid') === 'true' || phoneDigits() >= 9) checkPhone(); });
+      phone.addEventListener('blur', function () { checkPhone(); });
+      var sb = form.querySelector('button[type="submit"]');
+      if (sb) sb.addEventListener('click', function () { checkPhone(); });
+    }
+
+    form.addEventListener('focusin', function (e) {
+      var name = e.target.name || '';
+      if (!name) return;
+      lastField = name;
+      if (!started) {
+        started = true;
+        track('form_start', { form_type: type, first_field: name });
+      }
+      if (!seen[name]) {
+        seen[name] = true;
+        track('form_field', { form_type: type, field: name });
+      }
+    });
+
+    // Neplatné pole při odeslání (chybějící údaj, špatný formát)
+    form.addEventListener('invalid', function (e) {
+      track('form_error', { form_type: type, field: e.target.name || '' });
+    }, true);
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      submitted = true;
+      var service = form.elements.service ? form.elements.service.value : '';
+      var thanks = form.querySelector('[data-thanks]');
+      var submitBtn = form.querySelector('button[type="submit"]');
+      var endpoint = leadEndpointFor(form);
+
+      if (!endpoint) {
+        // Prototyp bez nasazeného Workeru: zachovat dosavadní chování (jen potvrzení).
+        track('generate_lead', { form_type: type, service: service });
+        finishOk(form, thanks, false);
+        return;
+      }
+
+      if (submitBtn) submitBtn.disabled = true;
+      // Časový limit, ať tlačítko nezůstane zablokované při výpadku sítě
+      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 15000) : null;
+      fetch(endpoint, { method: 'POST', body: new FormData(form), signal: ctrl ? ctrl.signal : undefined })
+        .then(function (res) {
+          if (!res.ok) throw new Error('send_failed');
+          // Konverze se měří až po úspěšném odeslání, aby se nepočítaly neodeslané poptávky
+          track('generate_lead', { form_type: type, service: service });
+          finishOk(form, thanks, true);
+        })
+        .catch(function () {
+          submitted = false;
+          showSendError(form, thanks);
+        })
+        .finally(function () {
+          if (timer) clearTimeout(timer);
+          if (submitBtn) submitBtn.disabled = false;
+        });
+    });
+
+    // Začal, ale neodeslal: odešel z stránky nebo přepnul záložku
+    function abandon() {
+      if (started && !submitted) {
+        track('form_abandon', { form_type: type, last_field: lastField });
+        started = false;
+      }
+    }
+    window.addEventListener('pagehide', abandon);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') abandon();
+    });
+  });
+
+  applyConsent(readConsent());
+})();
